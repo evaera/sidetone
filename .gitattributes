@@ -1,0 +1,7 @@
+# Consistent source line endings across Windows and other development hosts.
+* text=auto eol=lf
+
+# Preserve binary assets exactly.
+*.png binary
+*.ico binary
+*.wav binary

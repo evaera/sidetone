@@ -1,0 +1,24 @@
+# Build outputs and release archives.
+/target/
+/dist/
+
+# Locally prepared noise cancellation runtime and models.
+**/sidetone-cache/
+*.exe
+*.dll
+*.pdb
+*.node
+*.kef
+
+# Local diagnostics, temporary files, and environment secrets.
+*.log
+*.tmp
+*.rs.bk
+.env
+.env.*
+!.env.example
+
+# OS metadata.
+.DS_Store
+Thumbs.db
+Desktop.ini
