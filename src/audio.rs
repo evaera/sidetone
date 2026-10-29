@@ -35,6 +35,7 @@ struct Block {
 
 struct Worker {
     stop: Arc<AtomicBool>,
+    test_dropouts: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 impl Drop for Worker {
@@ -113,7 +114,8 @@ impl Controller {
                 let mut retry_delay = Duration::from_millis(500);
                 let mut progress_at = Instant::now();
                 let mut connected_at = Instant::now();
-                let mut progress = [0; 3];
+                let mut progress = [0; 5];
+                let mut degraded_windows = 0;
                 let mut previous_devices = None;
                 let mut test_started = None;
                 let mut injected_failure = false;
@@ -151,13 +153,15 @@ impl Controller {
                             && test_elapsed.is_some_and(|t| t.as_secs() >= 8)
                         {
                             injected_failure = true;
-                            audio._worker.stop.store(true, Ordering::Relaxed);
-                            // Let the normal stalled-callback watchdog discover it.
+                            audio._worker.test_dropouts.store(true, Ordering::Relaxed);
+                            // Drop alternate blocks while every callback keeps progressing.
                         }
                         if now.duration_since(progress_at) >= Duration::from_secs(2) {
                             let current = audio.counters.progress();
-                            if stalled(progress, current) {
-                                failure = Some("Audio callbacks or processing stalled".to_owned());
+                            if let Some(reason) =
+                                audio_fault(progress, current, &mut degraded_windows)
+                            {
+                                failure = Some(reason.to_owned());
                             }
                             progress = current;
                             progress_at = now;
@@ -205,6 +209,7 @@ impl Controller {
                                 }
                                 audio.ready.store(true, Ordering::Relaxed);
                                 progress = audio.counters.progress();
+                                degraded_windows = 0;
                                 progress_at = Instant::now();
                                 connected_at = progress_at;
                                 test_started.get_or_insert(progress_at);
@@ -235,19 +240,39 @@ impl Controller {
 }
 
 impl Counters {
-    fn progress(&self) -> [u64; 3] {
+    fn progress(&self) -> [u64; 5] {
         [
             self.captured.load(Ordering::Relaxed),
             self.rendered.load(Ordering::Relaxed),
             self.processed.load(Ordering::Relaxed),
+            self.underruns.load(Ordering::Relaxed),
+            self.late.load(Ordering::Relaxed),
         ]
     }
 }
-fn stalled(previous: [u64; 3], current: [u64; 3]) -> bool {
-    previous
+fn audio_fault(
+    previous: [u64; 5],
+    current: [u64; 5],
+    degraded_windows: &mut u8,
+) -> Option<&'static str> {
+    if previous[..3]
         .iter()
-        .zip(current)
-        .any(|(previous, current)| *previous == current)
+        .zip(&current[..3])
+        .any(|(previous, current)| previous == current)
+    {
+        return Some("Audio callbacks or processing stalled");
+    }
+    let rendered = current[1].saturating_sub(previous[1]);
+    let missing = current[3].saturating_sub(previous[3]);
+    let late = current[4].saturating_sub(previous[4]);
+    // Recover after more than 1% of samples miss their deadline in two consecutive
+    // two-second windows. One-off glitches and tray delay changes can settle first.
+    *degraded_windows = if missing > rendered / 100 || late > rendered / 100 {
+        degraded_windows.saturating_add(1)
+    } else {
+        0
+    };
+    (*degraded_windows >= 2).then_some("Audio playback repeatedly missed its timing deadline")
 }
 
 struct Audio {
@@ -309,6 +334,8 @@ impl Audio {
             })
         };
         let worker = {
+            let test_dropouts = Arc::new(AtomicBool::new(false));
+            let dropouts = test_dropouts.clone();
             let input = input_queue.clone();
             let output = queue.clone();
             let stop_flag = stop.clone();
@@ -337,8 +364,12 @@ impl Audio {
                         counters
                             .processing_max_us
                             .fetch_max(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-                        if counters.processed.fetch_add(1, Ordering::Relaxed) == 0 {
+                        let block_index = counters.processed.fetch_add(1, Ordering::Relaxed);
+                        if block_index == 0 {
                             crate::log("Live audio processing started");
+                        }
+                        if dropouts.load(Ordering::Relaxed) && block_index.is_multiple_of(2) {
+                            continue;
                         }
                         let mut emitted = 0;
                         let mut overflow = false;
@@ -360,6 +391,7 @@ impl Audio {
                 })?;
             Worker {
                 stop: stop.clone(),
+                test_dropouts,
                 thread: Some(thread),
             }
         };
@@ -519,6 +551,7 @@ where
     let mut pending = None;
     let mut previous = None;
     let mut minimum_delay = None;
+    let mut has_played = false;
     let mut selected_delay = delay_ms.load(Ordering::Relaxed);
     let mut clock = SampleClock::default();
     let mut envelope = 0.0f32;
@@ -531,6 +564,7 @@ where
                 selected_delay = requested;
                 // Do not repeat a previously played sample while filling a longer delay.
                 previous = None;
+                has_played = false;
                 envelope = 0.0;
             }
             let stopped = stop.load(Ordering::Relaxed);
@@ -562,9 +596,6 @@ where
                         None => (None, 0),
                     };
                     counters.late.fetch_add(late, Ordering::Relaxed);
-                    if pending.is_none() && queue.is_empty() {
-                        counters.underruns.fetch_add(1, Ordering::Relaxed);
-                    }
                     if value.is_some() {
                         sample_available = true;
                         counters.scheduled.fetch_add(1, Ordering::Relaxed);
@@ -573,6 +604,13 @@ where
                 } else {
                     [0.0; 2]
                 };
+                if sample_available {
+                    has_played = true;
+                } else if has_played && !stopped {
+                    // Count actual gaps, including gaps between queued blocks.
+                    // Initial buffering and filling a longer delay are not underruns.
+                    counters.underruns.fetch_add(1, Ordering::Relaxed);
+                }
                 if stopped || !sample_available {
                     envelope = 0.0;
                 }
@@ -597,12 +635,47 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::stalled;
+    use super::audio_fault;
     #[test]
     fn watchdog_requires_capture_playback_and_filter_progress() {
-        assert!(!stalled([10, 20, 30], [11, 21, 31]));
-        assert!(stalled([10, 20, 30], [10, 21, 31]));
-        assert!(stalled([10, 20, 30], [11, 20, 31]));
-        assert!(stalled([10, 20, 30], [11, 21, 30]));
+        let previous = [10, 20, 30, 0, 0];
+        assert!(audio_fault(previous, [11, 21, 31, 0, 0], &mut 0).is_none());
+        for stalled in [[10, 21, 31, 0, 0], [11, 20, 31, 0, 0], [11, 21, 30, 0, 0]] {
+            assert!(audio_fault(previous, stalled, &mut 0).is_some());
+        }
+    }
+
+    #[test]
+    fn watchdog_recovers_sustained_gaps_even_when_callbacks_keep_running() {
+        for bad_counter in [3, 4] {
+            let mut windows = 0;
+            let mut previous = [0; 5];
+            for window in 1..=2 {
+                let mut current = previous;
+                current[0] += 96_000;
+                current[1] += 96_000;
+                current[2] += 200;
+                current[bad_counter] += 2_400;
+                assert_eq!(
+                    audio_fault(previous, current, &mut windows).is_some(),
+                    window == 2
+                );
+                previous = current;
+            }
+        }
+    }
+
+    #[test]
+    fn watchdog_allows_buffering_and_transient_delay_changes() {
+        let mut windows = 0;
+        let initial = [96_000, 96_000, 200, 0, 0];
+        assert!(audio_fault([0; 5], initial, &mut windows).is_none());
+        let gap = [192_000, 192_000, 400, 9_600, 0];
+        assert!(audio_fault(initial, gap, &mut windows).is_none());
+        let recovered = [288_000, 288_000, 600, 9_600, 0];
+        assert!(audio_fault(gap, recovered, &mut windows).is_none());
+        assert_eq!(windows, 0);
+        let occasional = [384_000, 384_000, 800, 9_610, 10];
+        assert!(audio_fault(recovered, occasional, &mut windows).is_none());
     }
 }

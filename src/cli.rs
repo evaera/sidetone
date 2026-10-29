@@ -19,7 +19,7 @@ pub struct Cli {
     #[arg(long)]
     pub smoke_test: bool,
 
-    /// Run a twenty-second muted device recovery check
+    /// Run a twenty-five-second muted device and dropout recovery check
     #[arg(long)]
     pub reconnect_test: bool,
 }

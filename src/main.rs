@@ -299,7 +299,7 @@ fn run(cli: Cli) -> Result<()> {
             .collect();
         std::thread::spawn(move || {
             if recovery_test {
-                std::thread::sleep(Duration::from_secs(20));
+                std::thread::sleep(Duration::from_secs(25));
             } else {
                 // Exercise the same menu handler as real clicks, including both extremes.
                 for (delay, volume) in test_presets {
